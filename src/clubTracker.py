@@ -1,148 +1,117 @@
-import pandas as pd
-import requests
+from stravatools.scraper import StravaScraper
 import json
-import time
-import hashlib
 import pdb
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
 
-def getTokens(client_id, client_secret):
-    ## Get the tokens from file to connect to Strava
-    with open('strava_tokens.json') as json_file:
-        strava_tokens = json.load(json_file)
+VERSION = '0.1.0'
 
-    ## If access_token has expired then use the refresh_token to get the new access_token
-    if strava_tokens['expires_at'] < time.time():
-        #Make Strava auth API call with current refresh token
-        response = requests.post(
-            url = 'https://www.strava.com/oauth/token',
-            data = {
-                'client_id': client_id,
-                'client_secret': client_id,
-                'grant_type': 'refresh_token',
-                'refresh_token': strava_tokens['refresh_token']
-            }
-        )
+# https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/User-Agent
+USER_AGENT = "stravalib-scraper/%s" % VERSION
 
-        #Save response as json in new variable
-        new_strava_tokens = response.json()
+HEADERS = {'User-Agent': USER_AGENT}
 
-        # Save new tokens to file
-        with open('strava_tokens.json', 'w') as outfile:
-            json.dump(new_strava_tokens, outfile)
+BASE_URL = "https://www.strava.com"
 
-        #Use new Strava tokens from now
-        strava_tokens = new_strava_tokens
+URL_LOGIN = "%s/login" % BASE_URL
+URL_SESSION = "%s/session" % BASE_URL
+URL_DASHBOARD = "%s/dashboard" % BASE_URL
+URL_CLUB = "%s/clubs/781964/feed?feed_type=club" % BASE_URL
 
-    return strava_tokens
+seconds_per_unit = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
 
-def getMyActivities(tokens):
-    #Loop through all activities
-    page = 1
-    url = "https://www.strava.com/api/v3/activities"
-    access_token = tokens['access_token']
+def convert_to_seconds(s):
+    return int(s[:-1]) * seconds_per_unit[s[-1]]
 
-    ## Create the dataframe ready for the API call to store your activity data
-    activities = pd.DataFrame(
-        columns = [
-            "id",
-            "name",
-            "start_date_local",
-            "type",
-            "distance",
-            "moving_time",
-            "elapsed_time",
-            "total_elevation_gain",
-            "end_latlng",
-            "external_id"
-        ]
-    )
+def get_page(session, url):
+    response = session.get(url, headers=HEADERS)
+    response.raise_for_status()
+    return response
 
-    while True:
-        # get page of activities from Strava
-        r = requests.get(url + '?access_token=' + access_token + '&per_page=200' + '&page=' + str(page))
-        r = r.json()
-        # if no results then exit loop
-        if (not r):
-            break
+def parse_elapsed_time(to_parse):
+    return sum([convert_to_seconds(x) for x in to_parse.text.split()])
 
-        # otherwise add new data to dataframe
-        for x in range(len(r)):
-            activities.loc[x + (page-1)*200,'id'] = r[x]['id']
-            activities.loc[x + (page-1)*200,'name'] = r[x]['name']
-            activities.loc[x + (page-1)*200,'start_date_local'] = r[x]['start_date_local']
-            activities.loc[x + (page-1)*200,'type'] = r[x]['type']
-            activities.loc[x + (page-1)*200,'distance'] = r[x]['distance']
-            activities.loc[x + (page-1)*200,'moving_time'] = r[x]['moving_time']
-            activities.loc[x + (page-1)*200,'elapsed_time'] = r[x]['elapsed_time']
-            activities.loc[x + (page-1)*200,'total_elevation_gain'] = r[x]['total_elevation_gain']
-            activities.loc[x + (page-1)*200,'end_latlng'] = r[x]['end_latlng']
-            activities.loc[x + (page-1)*200,'external_id'] = r[x]['external_id']
+if __name__ == "__main__":
+    with open('.secret/api_credentials.json') as json_file:
+        credentials = json.load(json_file)
 
-        # increment page
-        page += 1
+    session = requests.Session()
 
-    activities.to_csv('strava_activities.csv')
+    session.cookies.clear()
 
-def getClubActivities(tokens, club_id):
-    #Loop through all activities
-    page = 1
-    url = "https://www.strava.com/api/v3/clubs/" + str(club_id) + "/activities"
-    access_token = tokens['access_token']
+    response = get_page(session, URL_LOGIN)
+
+    soup = BeautifulSoup(response.content, 'html.parser')
+
+    utf8 = soup.find_all('input',
+                         {'name': 'utf8'})[0].get('value').encode('utf-8')
+    token = soup.find_all('input',
+                          {'name': 'authenticity_token'})[0].get('value')
+    data = {
+        'utf8': utf8,
+        'authenticity_token': token,
+        'plan': "",
+        'email': credentials['email'],
+        'password': credentials['password'],
+    }
+
+    response = session.post(URL_SESSION,
+                            data=data,
+                            headers=HEADERS)
+    
+    response.raise_for_status()
+
+    
+    is_authed = True
 
     ## Create the dataframe ready for the API call to store your activity data
     activities = pd.DataFrame(
         columns = [
             "id",
             "athlete",
-            "name",
-            "start_date_local",
-            "start_date",
-            "timezone",
-            "type",
-            "distance",
-            "moving_time",
+            "data-updated-at",
             "elapsed_time",
-            "total_elevation_gain",
-            "end_latlng",
-            "external_id"
+            "distance",
+            "name",
         ]
     )
 
+    # Get initial response
+
+    cActs = 0
+    feedUrl = URL_CLUB
+    latestRecord = 0
+    
     while True:
-        # get page of activities from Strava
-        r = requests.get(url + '?access_token=' + access_token + '&per_page=200' + '&page=' + str(page))
-        r = r.json()
-        # if no results then exit loop
-        if (not r):
+        response = get_page(session, feedUrl)
+        soup = BeautifulSoup(response.content, 'lxml')
+        acts = soup.find_all('div', {"class": "activity"})
+
+        if (not acts):
             break
+    
+        for act in acts:
+            #pdb.set_trace()
+            activities.loc[cActs, 'id'] = int(act['id'].split('-')[1])
+            activities.loc[cActs, 'start_date_local'] = act.time['datetime']
+            activities.loc[cActs, 'data-updated-at'] = act['data-updated-at']
+            activities.loc[cActs, 'elapsed_time'] = parse_elapsed_time(act.find('li', {'title': 'Time'}))
+            try:
+                activities.loc[cActs, 'distance'] = float(act.find('li', {'title': 'Distance'}).text.split()[0])
+            except:
+                continue
+            activities.loc[cActs, 'name'] = act.find('strong').text.strip()
+            activities.loc[cActs, 'athlete'] = act.find('a', {'class': 'entry-athlete'}).text.strip().split('\n')[0]
+            
+            
+            latestRecord = act['data-updated-at']
+            
+            cActs = cActs + 1
+
+        feedUrl = URL_CLUB + '&before=' + latestRecord + '&cursor=' + latestRecord
         
-        pdb.set_trace()
-        
-        # otherwise add new data to dataframe
-        for x in range(len(r)):
-            activities.loc[x + (page-1)*200,'id'] = r[x]['id']
-            activities.loc[x + (page-1)*200,'athlete'] = r[x]['athlete']
-            activities.loc[x + (page-1)*200,'name'] = r[x]['name']
-            activities.loc[x + (page-1)*200,'start_date_local'] = r[x]['start_date_local']
-            activities.loc[x + (page-1)*200,'start_date'] = r[x]['start_date']
-            activities.loc[x + (page-1)*200,'timezone'] = r[x]['timezone']
-            activities.loc[x + (page-1)*200,'type'] = r[x]['type']
-            activities.loc[x + (page-1)*200,'distance'] = r[x]['distance']
-            activities.loc[x + (page-1)*200,'moving_time'] = r[x]['moving_time']
-            activities.loc[x + (page-1)*200,'elapsed_time'] = r[x]['elapsed_time']
-            activities.loc[x + (page-1)*200,'total_elevation_gain'] = r[x]['total_elevation_gain']
-            activities.loc[x + (page-1)*200,'end_latlng'] = r[x]['end_latlng']
-            activities.loc[x + (page-1)*200,'external_id'] = r[x]['external_id']
-
-        # increment page
-        page += 1
-
-    activities.to_csv('strava_club_activities.csv')
-
-
-if __name__ == "__main__":
-    strava_tokens = getTokens(57599, 'dedffa7b53675c71409841f6a0c70f8d8ffb448b')
-    #getMyActivities(strava_tokens)
-    getClubActivities(strava_tokens, 781964)
+    print(activities)
+    activities.to_csv('strava_activities.csv')
 
     
