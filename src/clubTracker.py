@@ -32,15 +32,14 @@ def get_page(session, url):
 def parse_elapsed_time(to_parse):
     return sum([convert_to_seconds(x) for x in to_parse.text.split()])
 
-if __name__ == "__main__":
-    with open('.secret/api_credentials.json') as json_file:
-        credentials = json.load(json_file)
+def load_json_file(filename):
+    with open(filename) as json_file:
+        json_data = json.load(json_file)
 
-    session = requests.Session()
+    return json_data
 
-    session.cookies.clear()
-
-    response = get_page(session, URL_LOGIN)
+def session_authenticate(session, credentials, url):    
+    response = get_page(session, url)
 
     soup = BeautifulSoup(response.content, 'html.parser')
 
@@ -62,9 +61,87 @@ if __name__ == "__main__":
     
     response.raise_for_status()
 
-    
-    is_authed = True
+    return True
 
+def scrape_single_activities(soup, start_index, activities, latest):
+    cActs = start_index
+    latestRecord = latest
+    
+    acts = soup.find_all('div', {"class": "activity"})
+
+    if (not acts):
+        print('Break')
+        return [activities, cActs, latestRecord]
+
+    for act in acts:
+        activities.loc[cActs, 'id'] = int(act['id'].split('-')[1])
+        activities.loc[cActs, 'start_date_local'] = act.time['datetime']
+        activities.loc[cActs, 'data-updated-at'] = act['data-updated-at']
+        activities.loc[cActs, 'elapsed_time'] = parse_elapsed_time(act.find('li', {'title': 'Time'}))
+
+        try:
+            activities.loc[cActs, 'distance'] = float(act.find('li', {'title': 'Distance'}).text.split()[0])
+        except:
+            activities.loc[cActs, 'distance'] = float(0)
+            
+        activities.loc[cActs, 'name'] = act.find('strong').text.strip()
+        activities.loc[cActs, 'athlete'] = act.find('a', {'class': 'entry-athlete'}).text.strip().split('\n')[0]
+
+        lat = int(act['data-updated-at'])
+
+        if lat < latestRecord:
+            latestRecord = lat
+            
+        cActs = cActs + 1
+
+    return [activities, cActs, latestRecord]
+
+def scrape_group_activities(soup, start_index, activities, latest):
+    cActs = start_index
+    latestRecord = latest
+    
+    acts = soup.find_all('div', {"class": "group-activity"})
+    
+    if (not acts):
+        print('Break')
+        return [activities, cActs, latestRecord]
+
+    for act in acts:
+        entries = act.find_all('li', {"class": "entity-details"})
+
+        for entry in entries:
+            activities.loc[cActs, 'id'] = int(entry['id'].split('-')[1])
+            activities.loc[cActs, 'start_date_local'] = act.time['datetime']
+            activities.loc[cActs, 'data-updated-at'] = act['data-updated-at']
+            activities.loc[cActs, 'elapsed_time'] = parse_elapsed_time(entry.find('li', {'title': 'Time'}))
+
+            try:
+                activities.loc[cActs, 'distance'] = float(entry.find('li', {'title': 'Distance'}).text.split()[0])
+            except:
+                activities.loc[cActs, 'distance'] = float(0)
+            
+            activities.loc[cActs, 'name'] = entry.find('strong').text.strip()
+            activities.loc[cActs, 'athlete'] = entry.find('a', {'class': 'entry-athlete'}).text.strip().split('\n')[0]
+
+            cActs = cActs + 1
+            
+        lat = int(act['data-updated-at'])
+
+        if lat < latestRecord:
+            latestRecord = lat
+
+    return [activities, cActs, latestRecord]
+
+if __name__ == "__main__":
+    # load credential data
+    credentials = load_json_file('.secret/api_credentials.json')
+
+    # create session and authenticate
+    session = requests.Session()
+    session.cookies.clear()
+
+    is_authed = session_authenticate(session, credentials, URL_LOGIN)
+    
     ## Create the dataframe ready for the API call to store your activity data
     activities = pd.DataFrame(
         columns = [
@@ -78,39 +155,29 @@ if __name__ == "__main__":
     )
 
     # Get initial response
-
     cActs = 0
     feedUrl = URL_CLUB
-    latestRecord = 0
+    latestRecord = 9999999999 
+    lastcActs = 0
     
     while True:
         response = get_page(session, feedUrl)
         soup = BeautifulSoup(response.content, 'lxml')
-        acts = soup.find_all('div', {"class": "activity"})
 
-        if (not acts):
-            break
-    
-        for act in acts:
-            #pdb.set_trace()
-            activities.loc[cActs, 'id'] = int(act['id'].split('-')[1])
-            activities.loc[cActs, 'start_date_local'] = act.time['datetime']
-            activities.loc[cActs, 'data-updated-at'] = act['data-updated-at']
-            activities.loc[cActs, 'elapsed_time'] = parse_elapsed_time(act.find('li', {'title': 'Time'}))
-            try:
-                activities.loc[cActs, 'distance'] = float(act.find('li', {'title': 'Distance'}).text.split()[0])
-            except:
-                continue
-            activities.loc[cActs, 'name'] = act.find('strong').text.strip()
-            activities.loc[cActs, 'athlete'] = act.find('a', {'class': 'entry-athlete'}).text.strip().split('\n')[0]
-            
-            
-            latestRecord = act['data-updated-at']
-            
-            cActs = cActs + 1
-
-        feedUrl = URL_CLUB + '&before=' + latestRecord + '&cursor=' + latestRecord
+        # Scrape individual feed activites
+        [activities, cActs, latestRecord] = scrape_single_activities(soup, cActs, activities, latestRecord)
         
+        # Scrape group feed activities
+        [activities, cActs, latestRecord] = scrape_group_activities(soup, cActs, activities, latestRecord)
+        
+        if(cActs == lastcActs):
+            break
+        else:
+            lastcActs = cActs
+            print(latestRecord)
+            
+        feedUrl = URL_CLUB + '&before=' + str(latestRecord) + '&cursor=' + str(latestRecord)
+    
     print(activities)
     activities.to_csv('strava_activities.csv')
 
